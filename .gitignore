@@ -1,0 +1,13 @@
+.env
+controle.csv
+controle.csv.tmp
+chaves.csv
+pdfs/
+logs/
+perfil/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
