@@ -407,16 +407,23 @@ def sincronizar_controle(controle: dict[str, Registro], chaves: list[str]) -> in
 
 
 def montar_fila(controle: dict[str, Registro], chaves: list[str], retentar: bool = False) -> list[str]:
-    """Fila da rodada: `pendente` + `erro`, mais `nao_encontrado` se `retentar`."""
-    elegiveis = {STATUS_PENDENTE, STATUS_ERRO}
+    """Fila da rodada: `pendente` + `erro`, mais `nao_encontrado` se `retentar`.
+
+    As chaves com `erro` vão para o fim: quem ainda não falhou tem prioridade, e
+    uma nota com problema no portal não atrasa as demais.
+    """
+    elegiveis = {STATUS_PENDENTE}
     if retentar:
         elegiveis.add(STATUS_NAO_ENCONTRADO)
     fila = []
+    com_erro = []
     for chave in chaves:
         reg = controle.get(chave)
         if reg is None or reg.status in elegiveis:
             fila.append(chave)
-    return fila
+        elif reg.status == STATUS_ERRO:
+            com_erro.append(chave)
+    return fila + com_erro
 
 
 def contar_status(controle: dict[str, Registro]) -> dict[str, int]:

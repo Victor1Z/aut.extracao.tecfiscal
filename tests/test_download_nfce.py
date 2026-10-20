@@ -146,7 +146,18 @@ def test_fila_com_retentar_inclui_nao_encontrado():
         C4: dn.Registro(C4, dn.STATUS_NAO_ENCONTRADO),
     }
 
-    assert dn.montar_fila(controle, [C1, C2, C3, C4], retentar=True) == [C1, C3, C4]
+    assert dn.montar_fila(controle, [C1, C2, C3, C4], retentar=True) == [C1, C4, C3]
+
+
+def test_fila_coloca_as_chaves_com_erro_por_ultimo():
+    controle = {
+        C1: dn.Registro(C1, dn.STATUS_ERRO),
+        C2: dn.Registro(C2, dn.STATUS_PENDENTE),
+        C3: dn.Registro(C3, dn.STATUS_ERRO),
+    }
+
+    # C4 não está no controle: é nova, entra como pendente antes dos erros.
+    assert dn.montar_fila(controle, [C1, C2, C3, C4]) == [C2, C4, C1, C3]
 
 
 def test_fila_ignora_chave_do_controle_ausente_da_entrada():
