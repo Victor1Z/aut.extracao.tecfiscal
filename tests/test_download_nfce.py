@@ -389,3 +389,101 @@ def test_processar_chave_nao_recarrega_se_tentativas_for_menor_que_3(monkeypatch
     assert resultado.status == dn.STATUS_ERRO
     assert page.gotos == []
     assert dn.normalizar_chave(None) == ""
+
+
+# ---------------------------------------------------------------------------
+# Erro de geração no portal (toast "Não foi possível gerar a danfe")
+# ---------------------------------------------------------------------------
+
+
+def test_processar_chave_nao_insiste_quando_o_portal_recusa_gerar(monkeypatch):
+    """Erro nos dados da nota: marca erro na 1ª tentativa e segue para a próxima."""
+    monkeypatch.setattr(dn, "clicar", lambda *a, **k: None)
+    monkeypatch.setattr(dn, "preencher", lambda *a, **k: None)
+    monkeypatch.setattr(dn, "aguardar_resultado", lambda *a, **k: True)
+
+    def recusa(*_a, **_k):
+        raise dn.ErroGeracaoPortal("Não foi possível gerar a danfe. xCpl é DBNull")
+
+    monkeypatch.setattr(dn, "baixar_arquivo", recusa)
+    monkeypatch.setattr(dn.time, "sleep", lambda _s: pytest.fail("não deveria esperar para repetir"))
+    page = PaginaFalsa()
+
+    resultado = dn.processar_chave(page, C1, None, 1000, tentativas=6)
+
+    assert resultado.status == dn.STATUS_ERRO
+    assert resultado.tentativas == 1
+    assert "xCpl" in resultado.erro
+    assert page.gotos == []
+
+
+class LocatorFalso:
+    def __init__(self, visivel=False, texto=""):
+        self.visivel = visivel
+        self.texto = texto
+
+    @property
+    def first(self):
+        return self
+
+    def count(self):
+        return 1 if self.visivel else 0
+
+    def is_visible(self):
+        return self.visivel
+
+    def inner_text(self, **_k):
+        return self.texto
+
+
+class PaginaComToast(PaginaFalsa):
+    """Clicar no DANFE não dispara download; faz aparecer o toast de erro."""
+
+    def __init__(self):
+        super().__init__()
+        self.toast = False
+        self.ouvintes = []
+
+    def on(self, _evento, funcao):
+        # Igual ao Playwright real: grava atributo no ouvinte. Método embutido
+        # (ex.: `lista.append`) estoura AttributeError aqui.
+        funcao._pw_impl_instance_ = None
+        self.ouvintes.append(funcao)
+
+    def remove_listener(self, _evento, funcao):
+        self.ouvintes.remove(funcao)
+
+    def wait_for_timeout(self, _ms):
+        pass
+
+    def locator(self, descritor):
+        erro = descritor in dn.SELETORES["notificacao_erro"]
+        return LocatorFalso(self.toast and erro, "Erro\nNão foi possível gerar a danfe.")
+
+    def get_by_text(self, _texto):
+        return LocatorFalso()
+
+
+def test_baixar_arquivo_detecta_o_toast_de_erro_sem_esperar_o_timeout(monkeypatch, tmp_path):
+    page = PaginaComToast()
+    monkeypatch.setattr(dn, "clicar", lambda *a, **k: setattr(page, "toast", True))
+
+    with pytest.raises(dn.ErroGeracaoPortal, match="Não foi possível gerar a danfe"):
+        dn.baixar_arquivo(page, C1, tmp_path, 1000)
+
+    assert page.ouvintes == []
+
+
+def test_fila_reprocessa_a_chave_que_deu_erro_na_rodada_anterior():
+    controle = {C1: dn.Registro(C1, status=dn.STATUS_ERRO, erro="Portal: xCpl é DBNull")}
+    assert dn.montar_fila(controle, [C1]) == [C1]
+
+
+def test_registrar_erro_grava_a_mensagem_completa(tmp_path):
+    log = tmp_path / "logs" / "erros.log"
+    dn.registrar_erro(C1, "linha 1\nlinha 2 " + "x" * 300, log)
+
+    conteudo = log.read_text(encoding="utf-8")
+    assert C1 in conteudo
+    assert "linha 1 linha 2" in conteudo
+    assert "x" * 300 in conteudo

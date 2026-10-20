@@ -41,6 +41,9 @@ SONDAGEM_MS = 500            # fatia de espera por localizador candidato
 PAUSA_ENTRE_TENTATIVAS = 3   # segundos entre tentativas da mesma chave
 TENTATIVAS_ANTES_RECARREGAR = 3  # erros seguidos até recarregar a página (bug de layout)
 
+# Navegadores tentados em ordem. None = Chromium baixado pelo Playwright.
+CANAIS_NAVEGADOR = (None, "msedge", "chrome")
+
 LOTE_PADRAO = 150
 TENTATIVAS_PADRAO = 6
 
@@ -48,6 +51,7 @@ CHAVES_PADRAO = "chaves.csv"
 CONTROLE_PADRAO = "controle.csv"
 DESTINO_PADRAO = "./pdfs"
 DIR_SCREENSHOTS = Path("logs/erros")
+LOG_ERROS = Path("logs/erros.log")
 
 STATUS_PENDENTE = "pendente"
 STATUS_BAIXADO = "baixado"
@@ -145,6 +149,20 @@ SELETORES: dict[str, list[str]] = {
         "papel:button:XML",
         "xpath=//linx-table-toolbar//button[contains(normalize-space(.),'XML')]",
     ],
+    # Toast que o portal mostra quando não consegue gerar o documento (ex.: "Não
+    # foi possível gerar a danfe... O valor da coluna 'xCpl' na tabela 'entrega'
+    # é DBNull"). Nesse caso o download nunca começa.
+    "notificacao_erro": [
+        ".ant-notification-notice:has(.ant-notification-notice-icon-error)",
+        ".ant-notification-notice-error",
+        ".ant-message-error",
+        "[role='alert']:has-text('Não foi possível')",
+        "texto:Não foi possível gerar",
+    ],
+    "fechar_notificacao": [
+        ".ant-notification-notice-close",
+        ".ant-notification-notice button[aria-label*='echar' i]",
+    ],
     "botao_fechar_modal": [
         "papel:button:Fechar",
         ".ant-modal-close",
@@ -196,6 +214,14 @@ class ErroPortal(RuntimeError):
 
 class SeletorNaoEncontrado(ErroPortal):
     """Nenhum localizador da lista resolveu para um elemento visível."""
+
+
+class ErroGeracaoPortal(ErroPortal):
+    """O portal recusou gerar o documento da nota (erro nos dados dela).
+
+    É determinístico: repetir na mesma rodada só gasta tempo. A chave fica como
+    `erro` e volta para a fila na próxima execução.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -602,12 +628,74 @@ def fechar_modal(page) -> None:
         pass
 
 
+def primeiro_visivel_agora(page, acao: str):
+    """Primeiro localizador de `acao` visível neste instante, sem esperar."""
+    for descritor in SELETORES[acao]:
+        try:
+            locator = resolver(page, descritor).first
+            if locator.count() and locator.is_visible():
+                return locator
+        except Exception:
+            continue
+    return None
+
+
+def mensagem_erro_portal(page) -> str:
+    """Texto do toast de erro do portal, ou "" se não houver nenhum."""
+    locator = primeiro_visivel_agora(page, "notificacao_erro")
+    if locator is None:
+        return ""
+    try:
+        return " ".join(locator.inner_text(timeout=1000).split()) or "Erro sem mensagem"
+    except Exception:
+        return "Erro sem mensagem"
+
+
+def fechar_notificacoes(page) -> None:
+    """Fecha os toasts abertos, para não confundirem a próxima nota."""
+    for descritor in SELETORES["fechar_notificacao"]:
+        try:
+            botoes = resolver(page, descritor)
+            for i in range(botoes.count()):
+                botao = botoes.nth(i)
+                if botao.is_visible():
+                    botao.click(timeout=2000)
+        except Exception:
+            continue
+
+
 def baixar_arquivo(
     page, chave: str, destino: Path, timeout_ms: int, acao: str = "botao_download"
 ) -> Path:
-    with page.expect_download(timeout=TIMEOUT_DOWNLOAD * 1000) as info:
+    """Clica no download e corre o evento de download x toast de erro do portal.
+
+    Quando o portal não consegue gerar o documento ele não dispara download:
+    mostra um toast de erro. Sem olhar para o toast, a espera iria até o
+    timeout do download em toda tentativa.
+    """
+    fechar_notificacoes(page)
+    downloads: list = []
+
+    # Precisa ser função Python: o Playwright grava um atributo no ouvinte, e
+    # método embutido (como `downloads.append`) não aceita atributo.
+    def ao_baixar(download) -> None:
+        downloads.append(download)
+
+    page.on("download", ao_baixar)
+    try:
         clicar(page, acao, timeout_ms)
-    download = info.value
+        limite = time.monotonic() + TIMEOUT_DOWNLOAD
+        while not downloads:
+            mensagem = mensagem_erro_portal(page)
+            if mensagem:
+                raise ErroGeracaoPortal(mensagem)
+            if time.monotonic() >= limite:
+                raise ErroPortal(f"O download não começou em {TIMEOUT_DOWNLOAD}s.")
+            # wait_for_timeout (e não time.sleep) para o Playwright processar o evento.
+            page.wait_for_timeout(300)
+    finally:
+        page.remove_listener("download", ao_baixar)
+    download = downloads[0]
     extensao = Path(download.suggested_filename).suffix or ".pdf"
     destino_arquivo = destino / f"{chave}{extensao}"
     download.save_as(str(destino_arquivo))
@@ -785,20 +873,47 @@ class Sessao:
         from playwright.sync_api import sync_playwright
 
         self._playwright = sync_playwright().start()
-        if self.perfil:
-            Path(self.perfil).mkdir(parents=True, exist_ok=True)
-            self._contexto = self._playwright.chromium.launch_persistent_context(
-                self.perfil, headless=self.headless, accept_downloads=True
-            )
-            self.page = self._contexto.pages[0] if self._contexto.pages else self._contexto.new_page()
-        else:
-            self._navegador = self._playwright.chromium.launch(headless=self.headless)
-            self._contexto = self._navegador.new_context(accept_downloads=True)
-            self.page = self._contexto.new_page()
+        self._lancar_navegador()
         self._contexto.set_default_timeout(self.timeout_ms)
         fazer_login(self.page, self.cfg, self.headless, self.timeout_ms, self.espera_login)
         if self.cfg.cnpj:
             selecionar_filial(self.page, self.cfg.cnpj, self.timeout_ms)
+
+    def _lancar_navegador(self) -> None:
+        """Chromium do Playwright; sem ele, cai para o Edge e depois o Chrome.
+
+        Em rede corporativa o download do Chromium (`playwright install`) pode
+        ser bloqueado pelo proxy. O Edge vem em todo Windows, então o robô roda
+        mesmo assim.
+        """
+        primeiro_erro = None
+        for canal in CANAIS_NAVEGADOR:
+            opcoes = {"headless": self.headless}
+            if canal:
+                opcoes["channel"] = canal
+            try:
+                if self.perfil:
+                    Path(self.perfil).mkdir(parents=True, exist_ok=True)
+                    self._contexto = self._playwright.chromium.launch_persistent_context(
+                        self.perfil, accept_downloads=True, **opcoes
+                    )
+                    paginas = self._contexto.pages
+                    self.page = paginas[0] if paginas else self._contexto.new_page()
+                else:
+                    self._navegador = self._playwright.chromium.launch(**opcoes)
+                    self._contexto = self._navegador.new_context(accept_downloads=True)
+                    self.page = self._contexto.new_page()
+            except Exception as exc:
+                primeiro_erro = primeiro_erro or exc
+                continue
+            if canal:
+                print(f"  aviso: Chromium do Playwright indisponível; usando o navegador '{canal}'.")
+            return
+        raise SystemExit(
+            "Não consegui abrir nenhum navegador (Chromium, Edge ou Chrome).\n"
+            f"Erro: {truncar(primeiro_erro, 300)}\n"
+            "Rode `python -m playwright install chromium` ou instale o Microsoft Edge."
+        )
 
     def fechar(self) -> None:
         for alvo in (self._contexto, self._navegador, self._playwright):
@@ -852,6 +967,9 @@ def processar_chave(
             arquivo = baixar_arquivo(page, chave, destino, timeout_ms, acao_download)
             fechar_modal(page)
             return ResultadoChave(STATUS_BAIXADO, arquivo=arquivo.name, tentativas=numero)
+        except ErroGeracaoPortal as exc:
+            # Erro nos dados da nota: não adianta insistir agora. Segue para a próxima.
+            return ResultadoChave(STATUS_ERRO, erro=f"Portal: {exc}", tentativas=numero)
         except Exception as exc:
             ultimo_erro = f"{type(exc).__name__}: {exc}"
             if numero < tentativas:
@@ -871,6 +989,16 @@ def salvar_screenshot(page, chave: str) -> None:
     try:
         DIR_SCREENSHOTS.mkdir(parents=True, exist_ok=True)
         page.screenshot(path=str(DIR_SCREENSHOTS / f"{chave}.png"), full_page=True)
+    except Exception:
+        pass
+
+
+def registrar_erro(chave: str, mensagem: str, caminho: Path = LOG_ERROS) -> None:
+    """Acrescenta o erro completo ao log. O controle guarda só um resumo truncado."""
+    try:
+        caminho.parent.mkdir(parents=True, exist_ok=True)
+        with caminho.open("a", encoding="utf-8") as f:
+            f.write(f"{agora_iso()}\t{chave}\t{' '.join(str(mensagem).split())}\n")
     except Exception:
         pass
 
@@ -911,6 +1039,7 @@ def comando_baixar(args: argparse.Namespace) -> int:
     print(f"{len(fila)} chave(s) na fila | {len(em_disco)} arquivo(s) já no destino.")
 
     processadas = 0
+    erros_rodada = 0
     interrompido = False
     sessao = Sessao(cfg, destino, args.headless, timeout_ms, args.perfil, args.espera_login)
     try:
@@ -946,8 +1075,13 @@ def comando_baixar(args: argparse.Namespace) -> int:
             elif resultado.status == STATUS_NAO_ENCONTRADO:
                 print(f"[{posicao}/{len(fila)}] {chave} não encontrado no portal")
             else:
+                # Screenshot antes de fechar o toast, para ele aparecer na imagem.
                 salvar_screenshot(sessao.page, chave)
-                print(f"[{posicao}/{len(fila)}] {chave} ERRO: {truncar(resultado.erro, 120)}")
+                fechar_notificacoes(sessao.page)
+                registrar_erro(chave, resultado.erro)
+                erros_rodada += 1
+                print(f"[{posicao}/{len(fila)}] {chave} AVISO - ERRO: {truncar(resultado.erro, 160)}")
+                print("    seguindo para a próxima; será reprocessada na próxima execução.")
     except KeyboardInterrupt:
         interrompido = True
         print("\nInterrompido pelo usuário. Gravando o controle...")
@@ -956,6 +1090,11 @@ def comando_baixar(args: argparse.Namespace) -> int:
         sessao.fechar()
 
     imprimir_resumo(controle, "Resumo parcial" if interrompido else "Resumo")
+    if erros_rodada:
+        print(
+            f"\nAVISO: {erros_rodada} nota(s) com erro nesta rodada. Detalhes em {LOG_ERROS}"
+            f" e prints em {DIR_SCREENSHOTS}/.\nRode o robô de novo para reprocessá-las."
+        )
     return 130 if interrompido else 0
 
 
