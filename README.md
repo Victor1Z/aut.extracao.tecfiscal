@@ -198,6 +198,3 @@ py -3.13 -m pytest tests -q
 Cobrem as funções puras: CSV de controle, sincronização, montagem da fila, importação
 do `.xlsm` e varredura de diretório. As funções de portal não têm cobertura
 automatizada — para validá-las use `inspecionar` mais uma rodada com `--limite 3`.
-#   a u t . e x t r a c a o . t e c f i s c a l 
- 
- 
